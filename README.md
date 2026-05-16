@@ -204,7 +204,7 @@ If you use this dataset, code, or model structure, please cite the associated pa
 ```bibtex
 @misc{khoshkdahan2026stopgotransformer,
   title        = {Driver Behavior Estimation at Signalized Intersections Using a Physics-Constrained Decision-Conditioned Autoregressive Transformer},
-  author       = {Khoshkdahan, Mohammad and Vinel, Alexey and Laskov, Pavel},
+  author       = {Khoshkdahan, Mohammad and Laskov, Pavel and Vinel, Alexey},
   year         = {2026},
   eprint       = {arXiv:to appear},
   archivePrefix= {arXiv},
