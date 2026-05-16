@@ -26,30 +26,30 @@ The full experiment produced 449 runs. The released modeling set contains 392 de
 
 The deployed model first predicts the driver decision and then generates the acceleration trajectory conditioned on that decision. The Stage 2 Transformer receives the current kinematic state, the previous post-constraint acceleration, the Stage 1 decision output, and the stopping goal. Its output is passed through deterministic physical constraints before kinematic integration.
 
-![Two-stage prediction pipeline](assets/two_stage_pipeline.png)
+![Two-stage prediction pipeline](assets/transformer_overview.png)
 
-The original paper figure is also provided as [`assets/architecture_pipeline_schematic_modern.pdf`](assets/architecture_pipeline_schematic_modern.pdf).
+The original paper figure is also provided as [`assets/transformer_overview.pdf`](assets/transformer_overview.pdf).
 
 ## Repository Layout
 
 ```text
 .
-├── assets/
-│   ├── overview_exp_setup.pdf
-│   ├── overview_exp_setup.png
-│   ├── architecture_pipeline_schematic_modern.pdf
-│   └── two_stage_pipeline.png
-├── data/
-│   ├── refined_run_level_dataset.csv
-│   └── processed_trajectory_cache/
-│       ├── trajectory_arrays.npz
-│       ├── trajectory_meta.csv
-│       └── trajectory_cache_info.json
-├── train_stage1_decision.py
-├── trajectory_transformer_ar.py
-├── trajectory_shared_utils.py
-├── requirements.txt
-└── results/
+|-- assets/
+|   |-- overview_exp_setup.pdf
+|   |-- overview_exp_setup.png
+|   |-- transformer_overview.pdf
+|   `-- transformer_overview.png
+|-- data/
+|   |-- refined_run_level_dataset.csv
+|   `-- processed_trajectory_cache/
+|       |-- trajectory_arrays.npz
+|       |-- trajectory_meta.csv
+|       `-- trajectory_cache_info.json
+|-- train_stage1_decision.py
+|-- trajectory_transformer_ar.py
+|-- trajectory_shared_utils.py
+|-- requirements.txt
+`-- results/
 ```
 
 The repository does not include raw logs, personal information, exploratory analysis scripts, or alternative baseline models. Heart-rate information is included only as whole-run change values, not as a time series.
