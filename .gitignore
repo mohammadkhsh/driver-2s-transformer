@@ -1,0 +1,35 @@
+﻿__pycache__/
+*.py[cod]
+.venv/
+.venv-gpu/
+venv/
+env/
+
+# Raw data and generated artifacts
+data/logs/
+results/**
+!results/README.md
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.pkl
+*.joblib
+*.pdf
+*.png
+*.svg
+*.eps
+*.aux
+*.log
+*.out
+*.toc
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local installers / binaries
+*.exe
+*.msi
