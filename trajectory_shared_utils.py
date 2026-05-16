@@ -455,6 +455,7 @@ def _load_public_trajectory_cache() -> tuple[pd.DataFrame, dict[str, np.ndarray]
 
 
 def prepare_modeling_dataframe(cfg: Config) -> tuple[pd.DataFrame, dict[str, np.ndarray], pd.DataFrame]:
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     if META_CSV.exists():
         meta = pd.read_csv(META_CSV)
         use_cached_directly = False

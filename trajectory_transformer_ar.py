@@ -814,7 +814,7 @@ def train_transformer_model(
 
         model.eval()
         with torch.no_grad():
-            # Cascade-first validation for ablations: select the checkpoint using stage-1 outputs,
+            # Cascade-first validation: select the checkpoint using stage-1 outputs,
             # not oracle decision labels on validation runs.
             roll_ca = _roll_from_x2(Xva_ca, v0va, d0va, Tva)
             val_loss, comps = _loss(roll_ca, ava, dva, vva, Tva, go_val_stage2, dEndVa, vEndVa, epoch)
@@ -1238,8 +1238,8 @@ def summarize_transformer_text(
     return "\n".join(lines)
 
 
-def archive_transformer_ablation_run(cfg: TransformerConfig, extra: dict[str, Any] | None = None) -> Path:
-    ab_root = OUT_DIR / "ablation_runs"
+def archive_transformer_run(cfg: TransformerConfig, extra: dict[str, Any] | None = None) -> Path:
+    ab_root = OUT_DIR / "run_snapshots"
     ab_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = ab_root / f"run_{stamp}"
@@ -1268,10 +1268,10 @@ def archive_transformer_ablation_run(cfg: TransformerConfig, extra: dict[str, An
         if p.exists():
             shutil.copy2(p, cache_subset / name)
     shutil.copy2(Path(__file__), run_dir / "trajectory_transformer_ar.py")
-    meta = {"timestamp": stamp, "config": asdict(cfg), "notes": "AR Transformer ablation snapshot"}
+    meta = {"timestamp": stamp, "config": asdict(cfg), "notes": "AR Transformer run snapshot"}
     if extra:
         meta.update(extra)
-    (run_dir / "ablation_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (run_dir / "run_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return run_dir
     return plot_info
 
@@ -1479,7 +1479,7 @@ def main() -> None:
     (OUT_DIR / "README_run.txt").write_text(
         "Run with project venv:\n  .\\.venv\\Scripts\\python.exe trajectory_transformer_ar.py\n", encoding="utf-8"
     )
-    archive_dir = archive_transformer_ablation_run(
+    archive_dir = archive_transformer_run(
         CFG,
         extra={
             "stage1_val_metrics": dec_metrics.get("val", {}),
@@ -1488,9 +1488,9 @@ def main() -> None:
             "plot_info": plot_info,
         },
     )
-    log_progress(f"Ablation archive saved to: {archive_dir}")
+    log_progress(f"Run snapshot saved to: {archive_dir}")
     print(report)
-    print(f"Ablation archive written to: {archive_dir}")
+    print(f"Run snapshot written to: {archive_dir}")
     print(f"\nOutputs written to: {OUT_DIR}")
     log_progress("Run finished successfully.")
 

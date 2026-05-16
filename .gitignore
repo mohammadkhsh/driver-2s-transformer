@@ -18,6 +18,7 @@ results/**
 *.joblib
 *.pdf
 *.png
+!assets/*.png
 *.svg
 *.eps
 *.aux
