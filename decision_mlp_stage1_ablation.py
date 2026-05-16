@@ -176,8 +176,8 @@ def build_stage1_matrix(df: pd.DataFrame, combo: dict[str, Any]) -> tuple[np.nda
 
 
 def snapshot_source_code() -> None:
-    shutil.copy2(ROOT / "trajectory_mixture_primitives.py", OUT_ROOT / "trajectory_mixture_primitives.py")
     shutil.copy2(ROOT / "decision_mlp_stage1_ablation.py", OUT_ROOT / "decision_mlp_stage1_ablation.py")
+    shutil.copy2(ROOT / "trajectory_shared_utils.py", OUT_ROOT / "trajectory_shared_utils.py")
 
 
 def run_ablation(seed: int, epochs: int, split_mode: str, train_ratio: float, force_cpu: bool) -> None:

@@ -1,14 +1,20 @@
-# Refined Run-Level Dataset
+﻿# Data files
 
-`refined_run_level_dataset.csv` contains one row per decision run used in the stop/go analysis (`n=392`). It is a sanitized run-level table derived from the raw experiment logs.
+This directory contains the public processed data used by the released prediction pipeline.
 
-The dataset includes kinematic variables at yellow onset, stop/go labels, demographic group variables, comfort ratings where applicable, braking-severity summaries, and run-level heart-rate summaries only. Raw GNSS traces, raw acceleration time series, raw heart-rate time series, original filenames, and participant names are not included.
+## `refined_run_level_dataset.csv`
 
-Heart-rate fields are aggregated over the whole run:
+One row corresponds to one decision run. The file includes the yellow-onset kinematic variables, stop/go labels, participant age/sex metadata, comfort rating when valid, and whole-run heart-rate summaries. It does not include raw GNSS fixes, raw heart-rate time series, or personally identifying information.
+
+Heart-rate fields are stored only as run-level summaries:
 
 - `hr_min_bpm`
 - `hr_max_bpm`
 - `hr_delta_bpm = hr_max_bpm - hr_min_bpm`
-- `hr_delta_pct = 100 * (hr_max_bpm - hr_min_bpm) / hr_min_bpm`
+- `hr_delta_pct = 100 * hr_delta_bpm / hr_min_bpm`
 
 Comfort ratings are valid only for stop-valid runs.
+
+## `processed_trajectory_cache/`
+
+Preprocessed fixed-length trajectories used by Stage 2. This cache contains acceleration, speed, and distance sequences aligned from yellow onset to the detected event, plus sanitized trajectory metadata. It lets the Transformer training scripts run without publishing the raw per-sample logs.

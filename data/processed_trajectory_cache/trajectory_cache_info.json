@@ -1,0 +1,8 @@
+{
+  "meta_rows": 392,
+  "traj_points": 64,
+  "a_clip_mps2": 12.0,
+  "stop_detect_min_m": -2.0,
+  "stop_detect_max_m": 6.5,
+  "extraction_logic_version": 3
+}

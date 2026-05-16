@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import json
+import argparse
 import math
 import random
 import shutil
@@ -193,7 +194,7 @@ def _compute_stop_extended_metrics(
 
 
 @dataclass
-class NodeConfig:
+class TransformerConfig:
     seed: int = 42
     traj_points: int = 64
     train_ratio: float = 0.60
@@ -208,19 +209,8 @@ class NodeConfig:
     decision_lr: float = 1e-3
     hidden_dim_decision: int = 64
 
-    node_epochs: int = 150
-    node_batch_size: int = 48
-    node_lr: float = 8e-4
     weight_decay: float = 1e-5
-    context_dim: int = 48
-    hidden_state_dim: int = 12
-    ode_hidden_dim: int = 96
-    rk_substeps: int = 3
-    max_abs_accel_mps2: float = 12.0
     max_abs_jerk_mps3: float = 15.0
-    reaction_delay_max_frac: float = 0.25
-    reaction_gate_sharpness: float = 18.0
-    stop_reaction_delay_min_steps: int = 3
     # AR Transformer settings
     ar_epochs: int = 140
     ar_batch_size: int = 24
@@ -258,7 +248,20 @@ class NodeConfig:
     example_plot_stop_ratio: float = 0.75
 
 
-CFG = NodeConfig()
+CFG = TransformerConfig()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train and validate the two-stage stop/go + autoregressive Transformer trajectory model."
+    )
+    parser.add_argument("--seed", type=int, default=CFG.seed)
+    parser.add_argument("--train-ratio", type=float, default=CFG.train_ratio)
+    parser.add_argument("--decision-epochs", type=int, default=CFG.decision_epochs)
+    parser.add_argument("--epochs", type=int, default=CFG.ar_epochs, help="Stage 2 Transformer epochs.")
+    parser.add_argument("--out-dir", type=str, default="results/trajectory_transformer_ar")
+    parser.add_argument("--force-cpu", action="store_true")
+    return parser.parse_args()
 
 
 def set_seed(seed: int) -> None:
@@ -282,8 +285,8 @@ def log_progress(message: str) -> None:
     print(line, flush=True)
 
 
-def patch_base_for_extraction(cfg: NodeConfig) -> None:
-    # Reuse the extraction/caching code from the mixture script but write into a new results folder.
+def patch_base_for_extraction(cfg: TransformerConfig) -> None:
+    # Reuse the shared extraction and caching utilities, but write into the Transformer results folder.
     base.OUT_DIR = OUT_DIR
     base.CACHE_DIR = CACHE_DIR
     base.PLOTS_DIR = PLOTS_DIR
@@ -295,7 +298,7 @@ def patch_base_for_extraction(cfg: NodeConfig) -> None:
     base.CFG.max_event_duration_s = cfg.max_event_duration_s
     base.CFG.use_only_voluntary = cfg.use_only_voluntary
     base.CFG.extraction_logic_version = cfg.extraction_logic_version
-    # Keep the early-stop inclusion fix from the mixture pipeline.
+    # Keep valid early stops around +6 m, which occurred in the recorded data.
     base.STOP_DETECT_MAX_M = 6.5
 
 
@@ -304,213 +307,6 @@ def batch_iter(indices: np.ndarray, batch_size: int, shuffle: bool = True) -> li
     if shuffle:
         np.random.shuffle(idx)
     return [idx[i : i + batch_size] for i in range(0, len(idx), batch_size)]
-
-
-class ContextEncoder(nn.Module):
-    def __init__(self, in_dim: int, context_dim: int, hidden_state_dim: int) -> None:
-        super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Linear(in_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.10),
-            nn.Linear(64, 64),
-            nn.ReLU(),
-        )
-        self.ctx_head = nn.Linear(64, context_dim)
-        self.h0_head = nn.Linear(64, hidden_state_dim)
-        self.a0_head = nn.Linear(64, 1)
-        self.duration_head = nn.Linear(64, 1)
-        self.delay_head = nn.Linear(64, 1)
-
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        h = self.backbone(x)
-        ctx = torch.tanh(self.ctx_head(h))
-        h0 = torch.tanh(self.h0_head(h))
-        # Start near zero acceleration at yellow onset (network can adjust slightly).
-        a0 = 0.8 * torch.tanh(self.a0_head(h)).squeeze(-1)
-        duration_s = 0.35 + 19.65 * torch.sigmoid(self.duration_head(h)).squeeze(-1)
-        delay_frac = torch.sigmoid(self.delay_head(h)).squeeze(-1)
-        ctx = torch.nan_to_num(ctx, nan=0.0, posinf=1.0, neginf=-1.0)
-        h0 = torch.nan_to_num(h0, nan=0.0, posinf=1.0, neginf=-1.0)
-        a0 = torch.nan_to_num(a0, nan=0.0, posinf=0.8, neginf=-0.8)
-        duration_s = torch.nan_to_num(duration_s, nan=2.5, posinf=20.0, neginf=0.35)
-        delay_frac = torch.nan_to_num(delay_frac, nan=0.08, posinf=1.0, neginf=0.0)
-        return {"context": ctx, "h0": h0, "a0": a0, "duration_s": duration_s, "delay_frac": delay_frac}
-
-
-class ODERHS(nn.Module):
-    def __init__(self, context_dim: int, hidden_state_dim: int, ode_hidden_dim: int, max_abs_jerk: float) -> None:
-        super().__init__()
-        self.hidden_state_dim = hidden_state_dim
-        self.max_abs_jerk = max_abs_jerk
-        in_dim = 1 + 3 + hidden_state_dim + context_dim  # t + [d,v,a] + h + c
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, ode_hidden_dim),
-            nn.Tanh(),
-            nn.Linear(ode_hidden_dim, ode_hidden_dim),
-            nn.Tanh(),
-            nn.Linear(ode_hidden_dim, 1 + hidden_state_dim),  # jerk + hdot
-        )
-
-    def forward(self, t_norm: torch.Tensor, y: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
-        d = y[:, 0:1]
-        v = y[:, 1:2]
-        a = y[:, 2:3]
-        h = y[:, 3:]
-        t_feat = t_norm.view(-1, 1)
-        feat = torch.cat([t_feat, d, v, a, h, ctx], dim=1)
-        out = self.net(feat)
-        jerk = self.max_abs_jerk * torch.tanh(out[:, 0:1])
-        hdot = torch.tanh(out[:, 1:])
-        d_dot = -v
-        v_dot = a
-        a_dot = jerk
-        return torch.cat([d_dot, v_dot, a_dot, hdot], dim=1)
-
-
-class NeuralODETrajectoryModel(nn.Module):
-    """Jerk-driven Neural ODE with hard event constraints for stop runs.
-
-    State y = [d, v, a, h].
-    Output trajectory uses constrained acceleration a_eff(t), not raw a(t), to ensure
-    exact zero acceleration and zero speed after the stop event.
-    """
-
-    def __init__(self, in_dim: int, cfg: NodeConfig) -> None:
-        super().__init__()
-        self.cfg = cfg
-        self.context_encoder = ContextEncoder(in_dim, cfg.context_dim, cfg.hidden_state_dim)
-        self.rhs = ODERHS(cfg.context_dim, cfg.hidden_state_dim, cfg.ode_hidden_dim, cfg.max_abs_jerk_mps3)
-
-    def _rk4_step(self, y: torch.Tensor, t0: torch.Tensor, dt: torch.Tensor, ctx: torch.Tensor) -> torch.Tensor:
-        f = self.rhs
-        k1 = f(t0, y, ctx)
-        k2 = f(t0 + 0.5 * dt, y + 0.5 * dt.view(-1, 1) * k1, ctx)
-        k3 = f(t0 + 0.5 * dt, y + 0.5 * dt.view(-1, 1) * k2, ctx)
-        k4 = f(t0 + dt, y + dt.view(-1, 1) * k3, ctx)
-        y_next = y + (dt.view(-1, 1) / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-        # Basic physical clipping (projection), done out-of-place to keep autograd stable.
-        d_next = y_next[:, 0:1]
-        v_next = torch.clamp(y_next[:, 1:2], min=0.0)  # speed
-        a_next = torch.clamp(
-            y_next[:, 2:3],
-            min=-self.cfg.max_abs_accel_mps2,
-            max=self.cfg.max_abs_accel_mps2,
-        )  # accel
-        h_next = y_next[:, 3:]
-        y_proj = torch.cat([d_next, v_next, a_next, h_next], dim=1)
-        return torch.nan_to_num(y_proj, nan=0.0, posinf=50.0, neginf=-50.0)
-
-    def forward(
-        self,
-        x_scaled: torch.Tensor,
-        v0_mps: torch.Tensor,
-        d0_m: torch.Tensor,
-        go_label: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        B = x_scaled.shape[0]
-        N = self.cfg.traj_points
-        enc = self.context_encoder(x_scaled)
-        ctx = enc["context"]
-        h0 = enc["h0"]
-        duration_s = enc["duration_s"]
-        # Delay applies mainly to stop maneuvers; go trajectories can still have negligible delay.
-        delay_frac = self.cfg.reaction_delay_max_frac * torch.sigmoid(enc["delay_frac"])
-        a0 = enc["a0"]
-
-        y = torch.cat([d0_m.view(-1, 1), v0_mps.view(-1, 1), a0.view(-1, 1), h0], dim=1)
-        y_list = [y]
-        a_eff_list: list[torch.Tensor] = [a0]
-        stopped = torch.zeros(B, dtype=torch.bool, device=x_scaled.device)
-        stop_mask_all = go_label < 0.5
-        go_mask_all = ~stop_mask_all
-        dt_macro = duration_s / max(N - 1, 1)
-
-        for k in range(N - 1):
-            yk = y_list[-1]
-            # Integrate with substeps on normalized time for smoother NODE dynamics.
-            y_next = yk
-            t_norm0 = torch.full((B,), k / max(N - 1, 1), dtype=torch.float32, device=x_scaled.device)
-            for sidx in range(self.cfg.rk_substeps):
-                sub_dt = dt_macro / self.cfg.rk_substeps
-                t_sub = t_norm0 + (sidx / self.cfg.rk_substeps) * (1.0 / max(N - 1, 1))
-                y_next = self._rk4_step(y_next, t_sub, sub_dt, ctx)
-
-            # Hard event-aware projection layer
-            d_prev = yk[:, 0]
-            v_prev = yk[:, 1]
-            a_prev = yk[:, 2]
-            d_new = y_next[:, 0]
-            v_new = y_next[:, 1]
-            a_new = y_next[:, 2]
-            h_new = y_next[:, 3:]
-
-            # Freeze after stop reached (exactly zero speed & accel, constant distance)
-            a_new = torch.where(stopped, torch.zeros_like(a_new), a_new)
-            v_new = torch.where(stopped, torch.zeros_like(v_new), v_new)
-            d_new = torch.where(stopped, d_prev, d_new)
-
-            # Reaction-delay gate for stop runs: use a smooth sigmoid gate to avoid a sharp release kink.
-            tau_next = torch.full((B,), (k + 1) / max(N - 1, 1), dtype=torch.float32, device=x_scaled.device)
-            active_stop_any = stop_mask_all & (~stopped)
-            gate = torch.sigmoid(self.cfg.reaction_gate_sharpness * (tau_next - delay_frac))
-            a_new = torch.where(active_stop_any, a_new * gate, a_new)
-
-            # After delay, hard stop constraints:
-            # 1) no positive acceleration for stop runs
-            active_stop = stop_mask_all & (~stopped) & (tau_next >= delay_frac)
-            a_new = torch.where(active_stop, torch.minimum(a_new, torch.zeros_like(a_new)), a_new)
-
-            # 2) enforce stop-ability before line: a <= -v^2/(2d)
-            valid_need = active_stop & (d_new > 0.0) & (v_new > 1e-4)
-            a_need = -torch.square(v_new) / torch.clamp(2.0 * d_new, min=1e-3)
-            a_new = torch.where(valid_need, torch.minimum(a_new, a_need), a_new)
-
-            # NOTE: stop-end taper removed because it over-constrained trajectories when combined
-            # with the hard stop freeze. We keep the smooth onset gate and hard event constraint.
-
-            # If stop trajectory crosses line, clamp exact event and freeze
-            crossed_line_stop = active_stop & (d_new <= 0.0)
-            d_new = torch.where(crossed_line_stop, torch.zeros_like(d_new), d_new)
-            v_new = torch.where(crossed_line_stop, torch.zeros_like(v_new), v_new)
-            a_new = torch.where(crossed_line_stop, torch.zeros_like(a_new), a_new)
-
-            # If stop trajectory reaches zero speed, freeze thereafter (stop before line allowed)
-            reached_zero_v = active_stop & (v_new <= 1e-4)
-            v_new = torch.where(reached_zero_v, torch.zeros_like(v_new), v_new)
-            a_new = torch.where(reached_zero_v, torch.zeros_like(a_new), a_new)
-
-            newly_stopped = crossed_line_stop | reached_zero_v
-            # Hard jerk limit on the final constrained acceleration, using the actual macro dt (seconds).
-            # Apply only while still moving; once a stop event is reached, exact zero is preserved.
-            moving_mask = ~(stopped | newly_stopped)
-            max_da = self.cfg.max_abs_jerk_mps3 * dt_macro
-            a_lo = a_prev - max_da
-            a_hi = a_prev + max_da
-            a_limited = torch.maximum(torch.minimum(a_new, a_hi), a_lo)
-            a_new = torch.where(moving_mask, a_limited, a_new)
-
-            stopped = stopped | newly_stopped
-            d_new = torch.where(stopped & (~newly_stopped), d_prev, d_new)
-
-            # Reassemble state with constrained d,v,a and continuous latent h
-            d_new = torch.nan_to_num(d_new, nan=0.0, posinf=200.0, neginf=-50.0)
-            v_new = torch.nan_to_num(v_new, nan=0.0, posinf=50.0, neginf=0.0)
-            a_new = torch.nan_to_num(a_new, nan=0.0, posinf=self.cfg.max_abs_accel_mps2, neginf=-self.cfg.max_abs_accel_mps2)
-            h_new = torch.nan_to_num(h_new, nan=0.0, posinf=10.0, neginf=-10.0)
-            y_next = torch.cat([d_new.view(-1, 1), v_new.view(-1, 1), a_new.view(-1, 1), h_new], dim=1)
-            y_list.append(y_next)
-            a_eff_list.append(a_new)
-
-        y_traj = torch.stack(y_list, dim=1)              # [B, N, 3+H]
-        a_eff = torch.stack(a_eff_list, dim=1)           # [B, N]
-        return {
-            "y_traj": y_traj,
-            "a_eff": a_eff,
-            "duration_s": duration_s,
-            "delay_frac": delay_frac,
-            "context": ctx,
-        }
 
 
 def make_stage2_features(
@@ -527,312 +323,6 @@ def make_stage2_features(
             sex_female.reshape(-1, 1),
         ]
     ).astype(np.float32)
-
-
-def train_node_model(
-    X2_train: np.ndarray,
-    X2_val_oracle: np.ndarray,
-    X2_val_cascade: np.ndarray,
-    a_train: np.ndarray,
-    a_val: np.ndarray,
-    d_traj_train: np.ndarray,
-    d_traj_val: np.ndarray,
-    v_traj_train: np.ndarray,
-    v_traj_val: np.ndarray,
-    dur_train: np.ndarray,
-    dur_val: np.ndarray,
-    v0_train: np.ndarray,
-    v0_val: np.ndarray,
-    d0_train: np.ndarray,
-    d0_val: np.ndarray,
-    go_train: np.ndarray,
-    go_val: np.ndarray,
-    d_end_train: np.ndarray,
-    d_end_val: np.ndarray,
-    v_end_train: np.ndarray,
-    v_end_val: np.ndarray,
-    cfg: NodeConfig,
-) -> tuple[NeuralODETrajectoryModel, dict[str, Any], dict[str, list[float]], StandardScaler]:
-    scaler = StandardScaler()
-    Xtr_sc = scaler.fit_transform(X2_train).astype(np.float32)
-    Xva_or_sc = scaler.transform(X2_val_oracle).astype(np.float32)
-    Xva_ca_sc = scaler.transform(X2_val_cascade).astype(np.float32)
-
-    model = NeuralODETrajectoryModel(in_dim=Xtr_sc.shape[1], cfg=cfg).to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.node_lr, weight_decay=cfg.weight_decay)
-
-    # Tensors
-    Xtr = torch.tensor(Xtr_sc, dtype=torch.float32, device=DEVICE)
-    Xva_or = torch.tensor(Xva_or_sc, dtype=torch.float32, device=DEVICE)
-    Xva_ca = torch.tensor(Xva_ca_sc, dtype=torch.float32, device=DEVICE)
-    atr = torch.tensor(a_train, dtype=torch.float32, device=DEVICE)
-    ava = torch.tensor(a_val, dtype=torch.float32, device=DEVICE)
-    dtr = torch.tensor(d_traj_train, dtype=torch.float32, device=DEVICE)
-    dva = torch.tensor(d_traj_val, dtype=torch.float32, device=DEVICE)
-    vtr = torch.tensor(v_traj_train, dtype=torch.float32, device=DEVICE)
-    vva = torch.tensor(v_traj_val, dtype=torch.float32, device=DEVICE)
-    Ttr = torch.tensor(dur_train, dtype=torch.float32, device=DEVICE)
-    Tva = torch.tensor(dur_val, dtype=torch.float32, device=DEVICE)
-    v0tr = torch.tensor(v0_train, dtype=torch.float32, device=DEVICE)
-    v0va = torch.tensor(v0_val, dtype=torch.float32, device=DEVICE)
-    d0tr = torch.tensor(d0_train, dtype=torch.float32, device=DEVICE)
-    d0va = torch.tensor(d0_val, dtype=torch.float32, device=DEVICE)
-    gotr = torch.tensor(go_train.astype(np.float32), dtype=torch.float32, device=DEVICE)
-    gova = torch.tensor(go_val.astype(np.float32), dtype=torch.float32, device=DEVICE)
-    dEndTr = torch.tensor(d_end_train, dtype=torch.float32, device=DEVICE)
-    dEndVa = torch.tensor(d_end_val, dtype=torch.float32, device=DEVICE)
-    vEndTr = torch.tensor(v_end_train, dtype=torch.float32, device=DEVICE)
-    vEndVa = torch.tensor(v_end_val, dtype=torch.float32, device=DEVICE)
-
-    hist = {
-        "train_total": [],
-        "val_total_oracle": [],
-        "val_accel_mae_oracle": [],
-        "val_d_end_mae_oracle": [],
-        "val_stop_zone_rate_oracle": [],
-    }
-    best_state: dict[str, torch.Tensor] | None = None
-    best_score = np.inf
-
-    def _loss(
-        out: dict[str, torch.Tensor],
-        a_true: torch.Tensor,
-        d_true: torch.Tensor,
-        v_true: torch.Tensor,
-        T_true: torch.Tensor,
-        go: torch.Tensor,
-        d_end: torch.Tensor,
-        v_end: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        a_hat = out["a_eff"]
-        y_traj = out["y_traj"]
-        d_hat = y_traj[:, :, 0]
-        v_hat = y_traj[:, :, 1]
-        a_state = y_traj[:, :, 2]
-        T_hat = out["duration_s"]
-        delay_frac = out["delay_frac"]
-
-        d_term = d_hat[:, -1]
-        v_term = v_hat[:, -1]
-        a_term = a_hat[:, -1]
-
-        stop_mask = (go < 0.5).float()
-        go_mask = 1.0 - stop_mask
-        stop_mask_bool = go < 0.5
-
-        traj_acc_loss = F.smooth_l1_loss(a_hat, a_true)
-        traj_dist_loss = 0.35 * F.smooth_l1_loss(d_hat, d_true)
-        traj_speed_loss = 0.30 * F.smooth_l1_loss(v_hat, v_true)
-        dur_loss = F.smooth_l1_loss(T_hat, T_true)
-        term_d_loss = F.smooth_l1_loss(d_term, d_end)
-        term_v_loss = F.smooth_l1_loss(v_term, v_end)
-
-        # Boundary emphasis (near-zero onset response and settled ending behavior)
-        edge_n = max(4, a_true.shape[1] // 10)
-        edge_acc_loss = F.smooth_l1_loss(a_hat[:, :edge_n], a_true[:, :edge_n]) + F.smooth_l1_loss(
-            a_hat[:, -edge_n:], a_true[:, -edge_n:]
-        )
-
-        # Hard constraints already applied in the decoder; losses keep the stop location in target band.
-        stop_band_high = torch.relu(d_term - STOP_CONSTRAINT_MAX_M)
-        stop_band_low = torch.relu(STOP_CONSTRAINT_MIN_M - d_term)
-        stop_band_loss = (((stop_band_high + stop_band_low) ** 2) * stop_mask).sum() / torch.clamp(stop_mask.sum(), min=1.0)
-        stop_v_zero_loss = ((torch.square(v_term) * stop_mask)).sum() / torch.clamp(stop_mask.sum(), min=1.0)
-        stop_a_zero_loss = ((torch.square(a_term) * stop_mask)).sum() / torch.clamp(stop_mask.sum(), min=1.0)
-        tail_k = max(4, a_hat.shape[1] // 12)
-        stop_tail_acc_loss = (((a_hat[:, -tail_k:] ** 2).mean(dim=1)) * stop_mask).sum() / torch.clamp(stop_mask.sum(), min=1.0)
-
-        # Go-event consistency (cross line with nonzero motion)
-        go_cross_loss = ((torch.square(torch.relu(d_term)) * go_mask)).sum() / torch.clamp(go_mask.sum(), min=1.0)
-        go_motion_loss = ((torch.square(torch.relu(0.3 - v_term)) * go_mask)).sum() / torch.clamp(go_mask.sum(), min=1.0)
-
-        # Smoothness/regularity on acceleration and jerk
-        da = a_state[:, 1:] - a_state[:, :-1]
-        jerk_proxy = da * (a_true.shape[1] - 1) / torch.clamp(T_hat.view(-1, 1), min=0.2)
-        smooth_acc = torch.mean(torch.square(a_hat[:, 1:] - a_hat[:, :-1]))
-        jerk_reg = torch.mean(torch.square(torch.clamp(jerk_proxy, min=-25.0, max=25.0)))
-        if a_hat.shape[1] >= 3:
-            curv_reg = torch.mean(torch.square(a_hat[:, 2:] - 2.0 * a_hat[:, 1:-1] + a_hat[:, :-2]))
-        else:
-            curv_reg = torch.tensor(0.0, dtype=torch.float32, device=DEVICE)
-
-        # Delay prior only for stop runs: encourage short but nonzero delay region (regularization, not hard)
-        if stop_mask_bool.any():
-            delay_stop = delay_frac[stop_mask_bool]
-            delay_reg = torch.mean(torch.square(torch.clamp(delay_stop - 0.08, min=-0.12, max=0.12)))
-        else:
-            delay_reg = torch.tensor(0.0, dtype=torch.float32, device=DEVICE)
-
-        total = (
-            1.00 * traj_acc_loss
-            + traj_dist_loss
-            + traj_speed_loss
-            + 0.80 * edge_acc_loss
-            + 1.20 * dur_loss
-            + 0.35 * term_d_loss
-            + 0.90 * term_v_loss
-            + 2.00 * stop_band_loss
-            + 1.50 * stop_v_zero_loss
-            + 1.50 * stop_a_zero_loss
-            + 0.20 * stop_tail_acc_loss
-            + 0.60 * go_cross_loss
-            + 0.25 * go_motion_loss
-            + 0.04 * smooth_acc
-            + 0.004 * jerk_reg
-            + 0.010 * curv_reg
-            + 0.05 * delay_reg
-        )
-        comps = {
-            "a_hat": a_hat.detach(),
-            "d_hat": d_hat.detach(),
-            "v_hat": v_hat.detach(),
-            "d_term": d_term.detach(),
-            "v_term": v_term.detach(),
-        }
-        return total, comps
-
-    for _epoch in range(cfg.node_epochs):
-        model.train()
-        tr_losses: list[float] = []
-        for bidx in batch_iter(np.arange(len(Xtr_sc)), cfg.node_batch_size, shuffle=True):
-            opt.zero_grad(set_to_none=True)
-            out = model(Xtr[bidx], v0tr[bidx], d0tr[bidx], gotr[bidx])
-            loss, _ = _loss(out, atr[bidx], dtr[bidx], vtr[bidx], Ttr[bidx], gotr[bidx], dEndTr[bidx], vEndTr[bidx])
-            if not torch.isfinite(loss):
-                continue
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step()
-            tr_losses.append(float(loss.detach().cpu()))
-        hist["train_total"].append(float(np.mean(tr_losses)) if tr_losses else float("nan"))
-
-        model.eval()
-        with torch.no_grad():
-            out_or = model(Xva_or, v0va, d0va, gova)
-            val_loss, comps = _loss(out_or, ava, dva, vva, Tva, gova, dEndVa, vEndVa)
-            a_pred = comps["a_hat"].cpu().numpy()
-            d_term = comps["d_term"].cpu().numpy()
-            v_term = comps["v_term"].cpu().numpy()
-        stop_mask_np = (go_val == 0)
-        stop_zone_rate = float(
-            np.mean(
-                (d_term[stop_mask_np] >= STOP_CONSTRAINT_MIN_M)
-                & (d_term[stop_mask_np] <= STOP_CONSTRAINT_MAX_M)
-                & (v_term[stop_mask_np] <= 0.3)
-            )
-        ) if stop_mask_np.any() else float("nan")
-        hist["val_total_oracle"].append(float(val_loss.detach().cpu()))
-        hist["val_accel_mae_oracle"].append(float(np.mean(np.abs(a_pred - a_val))))
-        hist["val_d_end_mae_oracle"].append(float(np.mean(np.abs(d_term - d_end_val))))
-        hist["val_stop_zone_rate_oracle"].append(stop_zone_rate)
-
-        score = hist["val_accel_mae_oracle"][-1] + 0.25 * hist["val_d_end_mae_oracle"][-1] + (0.30 * (1 - stop_zone_rate) if np.isfinite(stop_zone_rate) else 0.0)
-        if score < best_score:
-            best_score = score
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    def _eval(
-        X_sc: np.ndarray,
-        a_true_np: np.ndarray,
-        d_true_np: np.ndarray,
-        v_true_np: np.ndarray,
-        T_np: np.ndarray,
-        v0_np: np.ndarray,
-        d0_np: np.ndarray,
-        go_np: np.ndarray,
-        d_end_np: np.ndarray,
-        v_end_np: np.ndarray,
-    ) -> dict[str, Any]:
-        Xt = torch.tensor(X_sc, dtype=torch.float32, device=DEVICE)
-        v0t = torch.tensor(v0_np, dtype=torch.float32, device=DEVICE)
-        d0t = torch.tensor(d0_np, dtype=torch.float32, device=DEVICE)
-        got = torch.tensor(go_np.astype(np.float32), dtype=torch.float32, device=DEVICE)
-        with torch.no_grad():
-            out = model(Xt, v0t, d0t, got)
-        y_traj = out["y_traj"].cpu().numpy()
-        a_hat = out["a_eff"].cpu().numpy()
-        d_hat = y_traj[:, :, 0]
-        v_hat = y_traj[:, :, 1]
-        T_hat = out["duration_s"].cpu().numpy()
-        delay_frac = out["delay_frac"].cpu().numpy()
-        a_hat = np.nan_to_num(a_hat, nan=0.0, posinf=0.0, neginf=0.0)
-        d_hat = np.nan_to_num(d_hat, nan=0.0, posinf=0.0, neginf=0.0)
-        v_hat = np.nan_to_num(v_hat, nan=0.0, posinf=0.0, neginf=0.0)
-        T_hat = np.nan_to_num(T_hat, nan=1.0, posinf=20.0, neginf=0.35)
-        delay_frac = np.nan_to_num(delay_frac, nan=0.0, posinf=cfg.reaction_delay_max_frac, neginf=0.0)
-        stop_eval = _compute_stop_extended_metrics(
-            a_true=a_true_np,
-            d_true=d_true_np,
-            v_true=v_true_np,
-            T_true=T_np,
-            a_pred=a_hat,
-            d_pred=d_hat,
-            v_pred=v_hat,
-            T_pred=T_hat,
-            go=go_np,
-            d_end_obs=d_end_np,
-            v_end_obs=v_end_np,
-        )
-        d_term = stop_eval["d_term_eval"]
-        v_term = stop_eval["v_term_eval"]
-        metrics = {
-            "traj_mae_mps2": float(stop_eval["traj_mae_mps2"]),
-            "traj_rmse_mps2": float(stop_eval["traj_rmse_mps2"]),
-            "distance_curve_mae_m": float(stop_eval["distance_curve_mae_m"]),
-            "distance_curve_rmse_m": float(stop_eval["distance_curve_rmse_m"]),
-            "speed_curve_mae_mps": float(stop_eval["speed_curve_mae_mps"]),
-            "speed_curve_rmse_mps": float(stop_eval["speed_curve_rmse_mps"]),
-            "duration_mae_s": float(mean_absolute_error(T_np, T_hat)),
-            "duration_rmse_s": float(math.sqrt(mean_squared_error(T_np, T_hat))),
-            "terminal_distance_mae_m": float(mean_absolute_error(d_end_np, d_term)),
-            "terminal_speed_mae_mps": float(mean_absolute_error(v_end_np, v_term)),
-            "mean_delay_frac": float(np.mean(delay_frac)),
-            "median_delay_frac": float(np.median(delay_frac)),
-        }
-        stop_mask = (go_np == 0)
-        go_mask = ~stop_mask
-        if stop_mask.any():
-            metrics["stop_terminal_in_band_rate"] = float(
-                np.mean((d_term[stop_mask] >= STOP_CONSTRAINT_MIN_M) & (d_term[stop_mask] <= STOP_CONSTRAINT_MAX_M) & (v_term[stop_mask] <= 0.3))
-            )
-            metrics["stop_terminal_distance_bias_m"] = float(np.mean(d_term[stop_mask] - d_end_np[stop_mask]))
-        if go_mask.any():
-            metrics["go_crossed_light_rate"] = float(np.mean(d_term[go_mask] <= 0.0))
-            metrics["go_terminal_distance_bias_m"] = float(np.mean(d_term[go_mask] - d_end_np[go_mask]))
-        return {
-            "metrics": metrics,
-            "a_pred": a_hat,
-            "d_traj_pred": d_hat,
-            "v_traj_pred": v_hat,
-            "T_pred": T_hat,
-            "delay_frac": delay_frac,
-            "d_pred": d_term,
-            "v_pred": v_term,
-        }
-
-    train_eval = _eval(Xtr_sc, a_train, d_traj_train, v_traj_train, dur_train, v0_train, d0_train, go_train, d_end_train, v_end_train)
-    val_eval_oracle = _eval(Xva_or_sc, a_val, d_traj_val, v_traj_val, dur_val, v0_val, d0_val, go_val, d_end_val, v_end_val)
-    val_eval_cascade = _eval(Xva_ca_sc, a_val, d_traj_val, v_traj_val, dur_val, v0_val, d0_val, go_val, d_end_val, v_end_val)
-
-    metrics = {
-        "train_oracle_decision_input": train_eval["metrics"],
-        "val_oracle_decision_input": val_eval_oracle["metrics"],
-        "val_cascaded_decision_input": val_eval_cascade["metrics"],
-        "stage2_feature_names": ["v0_kmh", "d_th_m", "tti_s", "a_req_mps2", "age_years", "decision_go_class", "decision_go_prob", "sex_female"],
-        "node_config": asdict(cfg),
-    }
-    outputs = {
-        "X_train_scaled": Xtr_sc,
-        "X_val_oracle_scaled": Xva_or_sc,
-        "X_val_cascade_scaled": Xva_ca_sc,
-        "train_eval": train_eval,
-        "val_eval_oracle": val_eval_oracle,
-        "val_eval_cascade": val_eval_cascade,
-    }
-    return model, {"metrics": metrics, "outputs": outputs}, hist, scaler
 
 
 def compute_tti_and_areq(v_mps: torch.Tensor, d_m: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -886,7 +376,7 @@ def build_ar_token_scaler(
 
 
 class ARTrajectoryTransformer(nn.Module):
-    def __init__(self, feature_dim: int, cfg: NodeConfig) -> None:
+    def __init__(self, feature_dim: int, cfg: TransformerConfig) -> None:
         super().__init__()
         self.cfg = cfg
         self.token_proj = nn.Linear(feature_dim, cfg.d_model)
@@ -930,7 +420,7 @@ def rollout_ar_transformer(
     model: ARTrajectoryTransformer,
     token_mean: torch.Tensor,
     token_scale: torch.Tensor,
-    cfg: NodeConfig,
+    cfg: TransformerConfig,
     v0_mps: torch.Tensor,
     d0_m: torch.Tensor,
     duration_s: torch.Tensor,
@@ -1120,7 +610,7 @@ def train_transformer_model(
     d_end_val: np.ndarray,
     v_end_train: np.ndarray,
     v_end_val: np.ndarray,
-    cfg: NodeConfig,
+    cfg: TransformerConfig,
     token_feature_keep_mask: np.ndarray | None = None,
 ) -> tuple[ARTrajectoryTransformer, dict[str, Any], dict[str, list[float]], StandardScaler]:
     age_train = X2_train[:, 4].astype(np.float32)
@@ -1534,7 +1024,7 @@ def plot_transformer_results(
     traj_eval_oracle: dict[str, Any],
     traj_eval_cascade: dict[str, Any],
     hist: dict[str, list[float]],
-    cfg: NodeConfig,
+    cfg: TransformerConfig,
     out_dir: Path,
     val_go_pred: np.ndarray | None = None,
     val_go_prob: np.ndarray | None = None,
@@ -1679,153 +1169,8 @@ def plot_transformer_results(
     return plot_info
 
 
-def plot_node_results(
-    df_val: pd.DataFrame,
-    a_true_val: np.ndarray,
-    d_true_val: np.ndarray,
-    node_eval_oracle: dict[str, Any],
-    node_eval_cascade: dict[str, Any],
-    hist: dict[str, list[float]],
-    cfg: NodeConfig,
-    out_dir: Path,
-) -> dict[str, Any]:
-    # Training curves
-    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
-    ax.plot(hist["train_total"], lw=2.2, color="#1d3557", label="Train total loss")
-    ax.plot(hist["val_total_oracle"], lw=2.2, color="#e76f51", label="Val total loss (oracle)")
-    ax2 = ax.twinx()
-    ax2.plot(hist["val_accel_mae_oracle"], lw=2.0, ls="--", color="#2a9d8f", label="Val a_x MAE")
-    ax2.plot(hist["val_d_end_mae_oracle"], lw=2.0, ls=":", color="#6a4c93", label="Val terminal d MAE")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
-    ax2.set_ylabel("MAE")
-    ax.set_title("Neural ODE Trajectory Training Curves")
-    ax.grid(alpha=0.25)
-    h1, l1 = ax.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=9)
-    fig.tight_layout()
-    fig.savefig(out_dir / "node_training_curves.png", dpi=180, bbox_inches="tight")
-    fig.savefig(out_dir / "node_training_curves.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-    # Example trajectories (more samples)
-    a_or = node_eval_oracle["a_pred"]
-    a_ca = node_eval_cascade["a_pred"]
-    d_or = node_eval_oracle["d_traj_pred"]
-    d_ca = node_eval_cascade["d_traj_pred"]
-    delay_or = node_eval_oracle["delay_frac"]
-    go_mask = df_val["go_decision"].to_numpy(dtype=int) == 1
-    stop_mask = ~go_mask
-
-    def _pick(mask: np.ndarray, k: int) -> list[int]:
-        idx = np.flatnonzero(mask)
-        if len(idx) == 0:
-            return []
-        score = df_val.iloc[idx]["a_req_mps2"].to_numpy(dtype=float) + 0.01 * df_val.iloc[idx]["distance_threshold_m"].to_numpy(dtype=float)
-        idx = idx[np.argsort(score)]
-        if len(idx) <= k:
-            return idx.tolist()
-        return idx[np.linspace(0, len(idx) - 1, k, dtype=int)].tolist()
-
-    picks = _pick(stop_mask, 6) + _pick(go_mask, 6)
-    plot_info: dict[str, Any] = {"sample_indices": [], "sample_source_files": []}
-    if picks:
-        plot_info["sample_indices"] = [int(i) for i in picks]
-        plot_info["sample_source_files"] = df_val.iloc[picks]["source_file"].tolist()
-        cols = 4
-        rows = int(math.ceil(len(picks) / cols))
-        fig, axes = plt.subplots(rows, cols, figsize=(16, 4.3 * rows), squeeze=False)
-        d_lo = float(np.nanmin(d_true_val[picks]) - 2.0)
-        d_hi = float(np.nanmax(d_true_val[picks]) * 1.03)
-        first_twin = None
-        for ax, i in zip(axes.ravel(), picks):
-            T_true_i = float(df_val.iloc[i]["traj_duration_s"])
-            T_or_i = float(node_eval_oracle["T_pred"][i])
-            T_ca_i = float(node_eval_cascade["T_pred"][i])
-            t_true = np.linspace(0.0, max(T_true_i, 1e-3), cfg.traj_points)
-            t_or = np.linspace(0.0, max(T_or_i, 1e-3), cfg.traj_points)
-            t_ca = np.linspace(0.0, max(T_ca_i, 1e-3), cfg.traj_points)
-
-            ax.plot(t_true, a_true_val[i], color="#111827", lw=2.4, label="True a_x")
-            ax.plot(t_or, a_or[i], color="#2a9d8f", lw=2.0, label="NODE a_x (oracle)")
-            ax.plot(t_ca, a_ca[i], color="#e76f51", lw=1.8, ls="--", label="NODE a_x (cascade)")
-            ax.axhline(0.0, color="0.35", lw=1.0, ls=":")
-            ax.set_ylim(-6.5, 3.5)
-            axd = ax.twinx()
-            if first_twin is None:
-                first_twin = axd
-            axd.plot(t_true, d_true_val[i], color="#4c566a", lw=1.7, ls="-.", alpha=0.9, label="True d(t)")
-            axd.plot(t_or, d_or[i], color="#6a4c93", lw=1.4, ls=":", alpha=0.95, label="NODE d(t) oracle")
-            axd.plot(t_ca, d_ca[i], color="#9d4edd", lw=1.1, ls=(0, (3, 2)), alpha=0.7, label="NODE d(t) cascade")
-            axd.axhline(0.0, color="#6b7280", lw=0.9, ls="--")
-            if int(df_val.iloc[i]["go_decision"]) == 0:
-                axd.axhspan(STOP_CONSTRAINT_MIN_M, STOP_CONSTRAINT_MAX_M, color="#f4a261", alpha=0.08)
-            axd.set_ylim(d_lo, d_hi)
-            ax.axvline(float(delay_or[i]) * T_or_i, color="#264653", lw=0.9, ls="--", alpha=0.7)
-            ax.set_xlim(0.0, 1.02 * max(T_true_i, T_or_i, T_ca_i))
-            ax.set_title(
-                f"{'GO' if int(df_val.iloc[i]['go_decision']) else 'STOP'} | "
-                f"v0={df_val.iloc[i]['speed_at_yellow_kmh']:.0f} km/h, d0={df_val.iloc[i]['distance_threshold_m']:.0f} m\n"
-                f"{df_val.iloc[i]['source_file']}",
-                fontsize=8,
-            )
-            ax.set_xlabel("Time since yellow onset (s)")
-            ax.set_ylabel("a_x (m/s^2)")
-            axd.set_ylabel("d to light (m)")
-            ax.grid(alpha=0.25)
-        for ax in axes.ravel()[len(picks):]:
-            ax.axis("off")
-        h1, l1 = axes.ravel()[0].get_legend_handles_labels()
-        h2, l2 = (first_twin.get_legend_handles_labels() if first_twin is not None else ([], []))
-        fig.legend(h1 + h2, l1 + l2, loc="upper center", ncol=3, fontsize=9, frameon=True)
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
-        fig.savefig(out_dir / "node_examples.png", dpi=180, bbox_inches="tight")
-        fig.savefig(out_dir / "node_examples.pdf", bbox_inches="tight")
-        plt.close(fig)
-
-    # Terminal + delay diagnostics
-    fig = plt.figure(figsize=(13, 5))
-    gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 1.0])
-    ax0 = fig.add_subplot(gs[0, 0])
-    ax1 = fig.add_subplot(gs[0, 1])
-    d_true_end = df_val["traj_d_end_obs_m"].to_numpy(dtype=float)
-    d_pred_end = node_eval_oracle["d_pred"]
-    if stop_mask.any():
-        ax0.scatter(d_true_end[stop_mask], d_pred_end[stop_mask], color="#c1121f", s=35, alpha=0.75, label="Stop")
-    if go_mask.any():
-        ax0.scatter(d_true_end[go_mask], d_pred_end[go_mask], color="#2a9d8f", s=35, alpha=0.75, label="Go")
-    lo = float(np.nanmin([d_true_end.min(), d_pred_end.min()]))
-    hi = float(np.nanmax([d_true_end.max(), d_pred_end.max()]))
-    ax0.plot([lo, hi], [lo, hi], "k--", lw=1.3, label="Ideal")
-    ax0.axhspan(STOP_CONSTRAINT_MIN_M, STOP_CONSTRAINT_MAX_M, color="#f4a261", alpha=0.15, label="Stop target band")
-    ax0.set_xlabel("Observed terminal distance (m)")
-    ax0.set_ylabel("Predicted terminal distance (m)")
-    ax0.set_title("Neural ODE Terminal Distance (Validation)")
-    ax0.grid(alpha=0.25)
-    ax0.legend(fontsize=9)
-
-    delay = node_eval_oracle["delay_frac"]
-    delay_stop = delay[stop_mask]
-    delay_go = delay[go_mask]
-    bins = np.linspace(0, cfg.reaction_delay_max_frac, 14)
-    if len(delay_stop):
-        ax1.hist(delay_stop, bins=bins, alpha=0.8, color="#c1121f", label="Stop", density=True)
-    if len(delay_go):
-        ax1.hist(delay_go, bins=bins, alpha=0.7, color="#2a9d8f", label="Go", density=True)
-    ax1.set_xlabel("Predicted reaction-delay fraction")
-    ax1.set_ylabel("Density")
-    ax1.set_title("NODE Learned Delay Distribution (Validation)")
-    ax1.grid(alpha=0.25)
-    ax1.legend(fontsize=9)
-    fig.tight_layout()
-    fig.savefig(out_dir / "node_terminal_and_delay.png", dpi=180, bbox_inches="tight")
-    fig.savefig(out_dir / "node_terminal_and_delay.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-
 def summarize_transformer_text(
-    cfg: NodeConfig,
+    cfg: TransformerConfig,
     extraction_summary: pd.DataFrame,
     decision_metrics: dict[str, Any],
     tfm_metrics: dict[str, Any],
@@ -1893,7 +1238,7 @@ def summarize_transformer_text(
     return "\n".join(lines)
 
 
-def archive_transformer_ablation_run(cfg: NodeConfig, extra: dict[str, Any] | None = None) -> Path:
+def archive_transformer_ablation_run(cfg: TransformerConfig, extra: dict[str, Any] | None = None) -> Path:
     ab_root = OUT_DIR / "ablation_runs"
     ab_root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1931,128 +1276,19 @@ def archive_transformer_ablation_run(cfg: NodeConfig, extra: dict[str, Any] | No
     return plot_info
 
 
-def archive_ablation_run(cfg: NodeConfig, extra: dict[str, Any] | None = None) -> Path:
-    ab_root = OUT_DIR / "ablation_runs"
-    ab_root.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = ab_root / f"run_{stamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    # Core files for comparison across variants
-    files_to_copy = [
-        OUT_DIR / "report.txt",
-        OUT_DIR / "decision_metrics.json",
-        OUT_DIR / "node_metrics.json",
-        OUT_DIR / "validation_predictions.csv",
-        OUT_DIR / "validation_trajectory_arrays.npz",
-        OUT_DIR / "split_manifest.csv",
-        OUT_DIR / "feature_scalers.npz",
-        OUT_DIR / "trajectory_extraction_summary.csv",
-        OUT_DIR / "trajectory_node_state_dict.pt",
-        OUT_DIR / "decision_mlp_state_dict.pt",
-    ]
-    for p in files_to_copy:
-        if p.exists():
-            shutil.copy2(p, run_dir / p.name)
-
-    # Plots and selected cache diagnostics
-    if PLOTS_DIR.exists():
-        shutil.copytree(PLOTS_DIR, run_dir / "plots", dirs_exist_ok=True)
-    cache_subset = run_dir / "cache_subset"
-    cache_subset.mkdir(exist_ok=True)
-    for name in [
-        "trajectory_cache_info.json",
-        "trajectory_extraction_summary.csv",
-        "trajectory_meta.csv",
-    ]:
-        p = CACHE_DIR / name
-        if p.exists():
-            shutil.copy2(p, cache_subset / name)
-
-    # Snapshot the script for reproducibility
-    shutil.copy2(Path(__file__), run_dir / "trajectory_neural_ode.py")
-
-    meta = {
-        "timestamp": stamp,
-        "config": asdict(cfg),
-        "notes": "Neural ODE trajectory run archived for ablation comparison",
-    }
-    if extra:
-        meta.update(extra)
-    (run_dir / "ablation_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    return run_dir
-
-
-def summarize_text(
-    cfg: NodeConfig,
-    extraction_summary: pd.DataFrame,
-    decision_metrics: dict[str, Any],
-    node_metrics: dict[str, Any],
-    decision_hist: dict[str, list[float]],
-    node_hist: dict[str, list[float]],
-    df_train: pd.DataFrame,
-    df_val: pd.DataFrame,
-) -> str:
-    lines: list[str] = []
-    lines.append("Two-Stage Decision + Neural ODE Trajectory Model (Hard-Constrained Stop Event)")
-    lines.append("=" * 84)
-    lines.append("")
-    lines.append("Configuration")
-    lines.append(json.dumps(asdict(cfg), indent=2))
-    lines.append("")
-    lines.append("Dataset and Extraction")
-    lines.append(f"- Voluntary-only filter: {cfg.use_only_voluntary}")
-    lines.append(f"- Trajectory runs extracted: {len(df_train) + len(df_val)}")
-    lines.append(f"- Train/Val split: {len(df_train)}/{len(df_val)} ({cfg.train_ratio:.0%}/{1-cfg.train_ratio:.0%})")
-    lines.append(f"- Train stop/go: {(df_train['go_decision']==0).sum()} / {(df_train['go_decision']==1).sum()}")
-    lines.append(f"- Val stop/go: {(df_val['go_decision']==0).sum()} / {(df_val['go_decision']==1).sum()}")
-    lines.append("- Extraction status counts:")
-    for _, r in extraction_summary.head(10).iterrows():
-        lines.append(f"  - {r['status']}: {int(r['count'])}")
-    lines.append("")
-    lines.append("Stage 1 (Decision MLP) metrics")
-    for split in ("train", "val"):
-        m = decision_metrics[split]
-        lines.append(
-            f"- {split}: acc={m['accuracy']:.3f}, precision={m['precision']:.3f}, recall={m['recall']:.3f}, f1={m['f1']:.3f}, auroc={m['auroc']:.3f}, brier={m['brier']:.3f}"
-        )
-    lines.append(f"- Val confusion matrix [[TN, FP],[FN, TP]]: {decision_metrics['val_confusion_matrix']}")
-    lines.append("")
-    lines.append("Stage 2 (Neural ODE, jerk-driven, multi-task, hard event constraints)")
-    lines.append("- State: [d(t), v(t), a(t), h(t)] with learned jerk j_theta = da/dt")
-    lines.append("- Target trajectory: signed longitudinal acceleration a_x(t)=ax_g(t)")
-    lines.append("- Multi-task supervision: a_x(t), d(t), and v(t) with shared latent state")
-    lines.append("- Hard stop constraint in decoder: after stop event, enforce a=0, v=0, and d=constant exactly")
-    lines.append("- Additional hard safety projection for stop runs (post-reaction): no positive acceleration and stop-ability bound a<=-v^2/(2d)")
-    lines.append("- Stage-2 conditioning uses fixed onset decision class and decision confidence p(go) for the entire trajectory")
-    lines.append("- Feature normalization (train-only): StandardScaler fit on training features only, applied to val; outputs remain in physical units")
-    lines.append("")
-    lines.append("Core equations")
-    lines.append("  p(go|x)=sigma(f_theta(x))")
-    lines.append("  d_dot=-v, v_dot=a, a_dot=j_theta(t, d, v, a, h, z), h_dot=f_theta(t, d, v, a, h, z)")
-    lines.append("  z=[v0, d_th, TTI, a_req, age, decision_class, p_go, sex]")
-    lines.append("  Stop freeze (hard): if stop event reached => (a,v,d)=(0,0,d_stop) for all future steps")
-    lines.append("")
-    for key in ("train_oracle_decision_input", "val_oracle_decision_input", "val_cascaded_decision_input"):
-        m = node_metrics[key]
-        lines.append(
-            f"- {key}: a_MAE={m['traj_mae_mps2']:.3f}, a_RMSE={m['traj_rmse_mps2']:.3f}, dcurve_MAE={m['distance_curve_mae_m']:.3f}m, vcurve_MAE={m.get('speed_curve_mae_mps', float('nan')):.3f}m/s, duration_MAE={m['duration_mae_s']:.3f}s, d_end_MAE={m['terminal_distance_mae_m']:.3f}m, v_end_MAE={m['terminal_speed_mae_mps']:.3f}m/s"
-        )
-        if "stop_terminal_in_band_rate" in m:
-            lines.append(f"  stop_terminal_in_band_rate={m['stop_terminal_in_band_rate']:.3f}")
-        if "go_crossed_light_rate" in m:
-            lines.append(f"  go_crossed_light_rate={m['go_crossed_light_rate']:.3f}")
-        lines.append(f"  mean_delay_frac={m['mean_delay_frac']:.3f}, median_delay_frac={m['median_delay_frac']:.3f}")
-    lines.append("")
-    lines.append("Training summaries")
-    lines.append(f"- Decision final val F1/AUROC in history: {decision_hist['val_f1'][-1]:.3f}/{decision_hist['val_auc'][-1]:.3f}")
-    lines.append(
-        f"- NODE final val (oracle) loss/aMAE/dEndMAE/stopZoneRate: {node_hist['val_total_oracle'][-1]:.3f}/{node_hist['val_accel_mae_oracle'][-1]:.3f}/{node_hist['val_d_end_mae_oracle'][-1]:.3f}/{node_hist['val_stop_zone_rate_oracle'][-1]:.3f}"
-    )
-    return "\n".join(lines)
-
-
 def main() -> None:
+    global OUT_DIR, CACHE_DIR, PLOTS_DIR, PROGRESS_LOG, DEVICE
+    args = parse_args()
+    CFG.seed = int(args.seed)
+    CFG.train_ratio = float(args.train_ratio)
+    CFG.decision_epochs = int(args.decision_epochs)
+    CFG.ar_epochs = int(args.epochs)
+    OUT_DIR = ROOT / args.out_dir
+    CACHE_DIR = OUT_DIR / "cache"
+    PLOTS_DIR = OUT_DIR / "plots"
+    PROGRESS_LOG = OUT_DIR / "run_progress.log"
+    if args.force_cpu:
+        DEVICE = torch.device("cpu")
     ensure_dirs()
     set_seed(CFG.seed)
     patch_base_for_extraction(CFG)
@@ -2060,7 +1296,7 @@ def main() -> None:
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     log_progress(f"Run started | device={DEVICE} | torch={torch.__version__} | accelerator={gpu_name}")
 
-    # Reuse extraction + decision modeling infrastructure from the mixture script.
+    # Reuse shared extraction and decision modeling utilities.
     log_progress("Stage 0: extracting/loading trajectory dataset cache...")
     df, traj_arrays, extraction_summary = base.prepare_modeling_dataframe(base.CFG)
     if len(df) < 20:

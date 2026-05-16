@@ -13,6 +13,7 @@ results/**
 *.pth
 *.ckpt
 *.npz
+!data/processed_trajectory_cache/trajectory_arrays.npz
 *.pkl
 *.joblib
 *.pdf

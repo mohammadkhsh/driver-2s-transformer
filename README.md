@@ -1,83 +1,72 @@
-﻿# Human Driver Stopping Behaviour Modeling
+﻿# StopGo Transformer
 
-This repository contains the code and sanitized run-level dataset for modeling human driver stop/go decisions and braking trajectories at yellow-light onset. The main pipeline combines run-level decision analysis, comfort and heart-rate interpretation, and a kinematic-constrained autoregressive Transformer for signed acceleration-trajectory generation.
+This repository contains the code and processed data for predicting human driver stop/go behavior at yellow onset and generating the resulting longitudinal acceleration trajectory.
 
-Raw participant logs, high-frequency GNSS/acceleration traces, raw heart-rate time series, generated figures, trained weights, and paper files are intentionally excluded.
+The workflow has two stages.
 
-## What Is Included
+1. **Stage 1** predicts the driver decision, either `stop` or `go`, from yellow-onset variables.
+2. **Stage 2** uses an autoregressive Transformer to generate the signed acceleration trajectory. The rollout includes kinematic integration, terminal gating, actuator limits, and a jerk limiter so the generated trajectory stays physically usable.
 
-- A sanitized refined run-level dataset with 392 decision runs.
-- Run-level heart-rate summaries only, including minimum HR, maximum HR, absolute HR elevation, and percentage HR elevation over the whole run.
-- Stop/go decision analysis scripts.
-- Comfort and heart-rate analysis scripts.
-- Dataset/statistics figure generators.
-- The two-stage decision plus autoregressive Transformer trajectory pipeline.
-- Ablation and visualization scripts for the Transformer pipeline.
+The repository intentionally excludes raw logs, personal information, exploratory analysis scripts, Neural ODE baselines, and mixture-of-primitives baselines. The released dataset is refined and run-level. Heart-rate data are included only as whole-run summaries, not as time-series signals.
 
-## Repository Structure
+## Repository Layout
 
 ```text
 .
 ├── data/
-│   ├── refined_run_level_dataset.csv     # Sanitized run-level dataset
-│   └── README.md                         # Dataset field notes
-├── results/README.md                     # Placeholder for generated outputs
-├── analysis_decision.py                  # Stop/go decision modeling and decision-surface figures
-├── analysis_hr_comfort.py                # Comfort, HR-delta, and braking-severity analysis
-├── generate_data_collection_section.py   # Dataset/statistics figures
-├── paper_decision_figures.py             # AME, diagnostics, and decision-surface figures
-├── decision_mlp_stage1_ablation.py       # Stage-1 decision ablations
-├── trajectory_shared_utils.py            # Shared extraction, preprocessing, and Stage-1 utilities
-├── trajectory_transformer_ar.py          # Main two-stage AR Transformer trajectory pipeline
-├── trajectory_transformer_ar_ablation.py # Curated Transformer input-modality ablations
-├── plot_transformer_correct12_examples.py
-├── plot_transformer_misclassified_examples.py
-├── plot_transformer_go_cross_fail_examples.py
-├── run_stop_aligned_reruns.py
-└── requirements.txt
+│   ├── refined_run_level_dataset.csv
+│   └── processed_trajectory_cache/
+│       ├── trajectory_arrays.npz
+│       ├── trajectory_meta.csv
+│       └── trajectory_cache_info.json
+├── decision_mlp_stage1_ablation.py
+├── trajectory_transformer_ar.py
+├── trajectory_transformer_ar_ablation.py
+├── trajectory_shared_utils.py
+├── requirements.txt
+└── results/
 ```
 
-## Environment Setup
+## Environment
 
-Python 3.11 is recommended.
+Python 3.11 is recommended. CUDA is used automatically by PyTorch when available.
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate
+source .venv/Scripts/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-For GPU training, install a CUDA-enabled PyTorch wheel matching your system. For CUDA 12.1, use:
+For NVIDIA GPU support, install the CUDA build of PyTorch if your current PyTorch installation is CPU-only.
 
 ```bash
-pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Verify CUDA availability:
+Check the active device with:
 
 ```bash
 python - <<'PY'
 import torch
+print(torch.__version__)
 print(torch.cuda.is_available())
 print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')
 PY
 ```
 
-## Dataset
+## Data
 
-The public dataset is located at:
+The main public file is:
 
 ```text
 data/refined_run_level_dataset.csv
 ```
 
-Each row corresponds to one decision run. The table includes yellow-onset kinematics, stop/go labels, demographic fields, comfort rating where valid, peak braking summaries, and whole-run HR summaries. Raw time-series HR values are not included.
+Important columns include:
 
-Important fields include:
-
-- `distance_threshold_m`
 - `speed_at_yellow_kmh`
+- `distance_threshold_m`
 - `tti_s`
 - `a_req_mps2`
 - `go_decision`
@@ -87,64 +76,128 @@ Important fields include:
 - `hr_delta_bpm`
 - `hr_delta_pct`
 
-Comfort ratings are valid only for stop-valid runs.
+Stage 2 uses:
 
-## Main Workflow
-
-Generate data-collection statistics:
-
-```bash
-python generate_data_collection_section.py
+```text
+data/processed_trajectory_cache/
 ```
 
-Analyze stop/go decision structure:
+This cache contains fixed-length acceleration, speed, and distance trajectories. It is included so the Transformer can be trained and validated without the raw per-sample logs.
+
+## Stage 1 Stop/Go Decision Model
+
+Stage 1 trains an MLP classifier for the stop/go decision. The default split is 60 percent training and 40 percent validation.
+
+Run a random stratified split:
 
 ```bash
-python analysis_decision.py
-python paper_decision_figures.py
+python decision_mlp_stage1_ablation.py \
+  --split-mode run_stratified \
+  --train-ratio 0.60 \
+  --epochs 100 \
+  --seed 42 \
+  --out-dir results/stage1_run_stratified
 ```
 
-Analyze comfort and run-level HR elevation:
+Run a participant-disjoint split:
 
 ```bash
-python analysis_hr_comfort.py
+python decision_mlp_stage1_ablation.py \
+  --split-mode participant_disjoint \
+  --train-ratio 0.60 \
+  --epochs 100 \
+  --seed 42 \
+  --out-dir results/stage1_participant_disjoint
 ```
 
-Train the two-stage Transformer trajectory model:
+Useful parameters:
+
+- `--split-mode` chooses `run_stratified` or `participant_disjoint`.
+- `--train-ratio` sets the training fraction.
+- `--epochs` sets the Stage 1 training epochs.
+- `--seed` fixes the random seed.
+- `--force-cpu` disables CUDA.
+
+## Stage 2 Autoregressive Transformer
+
+Stage 2 trains the full pipeline. Stage 1 is trained first, and its predicted decision label and confidence are passed into the Transformer. Validation uses the deployed cascade behavior, meaning the trajectory model receives the predicted decision, not the ground-truth decision.
 
 ```bash
-python trajectory_transformer_ar.py
+python trajectory_transformer_ar.py \
+  --seed 42 \
+  --train-ratio 0.60 \
+  --decision-epochs 80 \
+  --epochs 140 \
+  --out-dir results/trajectory_transformer_ar
 ```
 
-Run curated Transformer ablations:
+Useful parameters:
+
+- `--decision-epochs` controls Stage 1 training inside the full pipeline.
+- `--epochs` controls Stage 2 Transformer training.
+- `--train-ratio` controls the 60/40 split.
+- `--out-dir` controls where models, metrics, predictions, plots, and logs are written.
+- `--force-cpu` runs without CUDA.
+
+The main outputs are written to the selected output directory:
+
+- `decision_metrics.json`
+- `transformer_metrics.json`
+- `validation_predictions.csv`
+- `validation_trajectory_arrays.npz`
+- `decision_mlp_state_dict.pt`
+- `trajectory_transformer_state_dict.pt`
+- `run_progress.log`
+- `report.txt`
+
+`run_progress.log` is updated during training, so it can be opened in an editor while the model runs.
+
+## Ablation Runs
+
+The ablation script evaluates selected input sets for Stage 2. It supports both random stratified and participant-disjoint validation.
 
 ```bash
-python trajectory_transformer_ar_ablation.py
+python trajectory_transformer_ar_ablation.py \
+  --seed 42 \
+  --epochs 140 \
+  --decision-epochs 80 \
+  --split-modes run_stratified,participant_disjoint \
+  --combo-preset curated_user \
+  --out-dir results/trajectory_transformer_ar_ablation
 ```
 
-Plot representative Transformer rollouts:
+For a quick smoke test:
 
 ```bash
-python plot_transformer_correct12_examples.py
+python trajectory_transformer_ar_ablation.py \
+  --seed 42 \
+  --epochs 5 \
+  --decision-epochs 5 \
+  --max-combos 1 \
+  --split-modes run_stratified \
+  --out-dir results/smoke_test
 ```
 
-## Model Summary
+## Updating the GitHub Repository
 
-Stage 1 predicts the binary stop/go decision at yellow onset. Stage 2 uses this predicted decision and confidence, together with kinematic state and context, to autoregressively generate signed longitudinal acceleration. The raw Transformer output is passed through terminal gating, jerk limiting, actuator clamping, and discrete kinematic integration so that generated trajectories remain physically plausible.
+After changing files locally:
 
-The default Transformer uses an 11-dimensional token, a 96-dimensional embedding, four attention heads, and a per-head dimension of 24. The post-processing pipeline enforces bounded jerk and stop-aware terminal behavior.
+```bash
+git status
+git add README.md data/ decision_mlp_stage1_ablation.py trajectory_transformer_ar.py trajectory_transformer_ar_ablation.py trajectory_shared_utils.py requirements.txt .gitignore
+git commit -m "Update public StopGo Transformer release"
+git push
+```
 
-## Reproducibility Notes
+If you renamed the remote repository, first check the remote URL:
 
-- The public dataset is run-level and sanitized.
-- Raw logs are not required for using the released dataset, but full trajectory retraining from raw time series requires the original private logs.
-- The scripts write generated outputs to `results/`.
-- Participant-disjoint validation and input-modality ablation are supported.
+```bash
+git remote -v
+```
 
-## License
+Then update it if needed:
 
-No license is assigned yet. Add a `LICENSE` file before making the repository public if reuse terms should be explicit.
-
-## Citation
-
-If this code or dataset is used in a publication, cite the associated paper once available.
+```bash
+git remote set-url origin https://github.com/mohammadkhsh/stopgo-transformer.git
+git push -u origin main
+```
