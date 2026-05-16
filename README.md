@@ -1,30 +1,44 @@
 ﻿# StopGo Transformer
 
-This repository contains the public code and processed data for predicting whether a human driver will stop or go at yellow onset, and for generating the longitudinal acceleration trajectory that follows that decision.
+![Python](https://img.shields.io/badge/Python-3.11-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-2.x-ee4c2c)
+![Task](https://img.shields.io/badge/task-stop%2Fgo%20%2B%20trajectory%20prediction-0f766e)
 
-![Two-stage prediction pipeline](assets/pipeline_overview.png)
+This repository contains the public code and processed data for predicting human driver stop/go behavior at yellow onset and generating the following longitudinal acceleration trajectory.
 
-The model has two stages. Stage 1 predicts the stop/go decision from yellow-onset driving conditions. Stage 2 uses the predicted decision and confidence score together with the vehicle state to generate a signed acceleration trajectory using an autoregressive Transformer with kinematic constraints.
+The released pipeline has two stages. Stage 1 predicts the stop/go decision from the driving state at yellow onset. Stage 2 uses the predicted decision and its confidence score to generate a physically constrained acceleration trajectory with an autoregressive Transformer.
 
-The repository does not include raw logs, personal information, exploratory analysis scripts, or alternative baseline models. The released dataset is refined for model training. Heart-rate information is included only as whole-run change values, not as a time series.
+The paper preprint will be available on arXiv. If you use this repository or dataset, please cite the paper using the BibTeX entry at the end of this README.
 
-## Experiment Summary
+## Experiment Overview
 
-The data were collected with a standard passenger vehicle on a road equipped with a standard traffic light. Drivers approached the light at instructed speeds of 40, 50, 60, and selected 70 km/h cases. The yellow onset distance was varied over a wide range so that the dataset includes easy-stop, easy-go, and ambiguous stop/go cases.
+The dataset was collected with a standard passenger vehicle approaching a road traffic light under different instructed speeds and yellow-onset distances. The setup was designed to capture both the driver decision at yellow onset and the braking trajectory after the decision.
 
-Vehicle motion was measured with a VBOX Touch GNSS logger using RTK correction through an NTRIP modem. Experiments were started only after RTK fix was available. The traffic light was controlled by an NVIDIA Jetson Orin connected to an STM32 relay controller. The vehicle laptop and traffic-light controller communicated through TP-Link EAP215 outdoor access points. This allowed the yellow phase to be triggered from the vehicle side at the desired longitudinal distance.
+![Experiment setup overview](assets/overview_exp_setup.png)
 
-The full experiment produced 449 runs. The released decision and trajectory modeling set contains 392 decision runs after excluding non-decision trials. For each run, the dataset contains yellow-onset speed, distance threshold, TTI, required deceleration, stop/go label, demographic metadata, comfort rating when valid, maximum deceleration, and whole-run heart-rate change.
+The original paper figure is also provided as [`assets/overview_exp_setup.pdf`](assets/overview_exp_setup.pdf).
 
-![Experiment distribution and speed tracking](assets/experiment_distribution.png)
+Vehicle motion was measured using a VBOX Touch GNSS logger with RTK correction through an NTRIP modem. Experiments started only after RTK fix was available. The traffic light was controlled by an NVIDIA Jetson Orin connected to an STM32 relay board, and the vehicle laptop communicated with the traffic-light unit through TP-Link EAP215 outdoor access points. This allowed the yellow phase to be triggered from the vehicle side at the desired longitudinal distance.
+
+The full experiment produced 449 runs. The released modeling set contains 392 decision runs after excluding non-decision trials. For each run, the dataset stores yellow-onset speed, distance threshold, TTI, required deceleration, stop/go label, participant metadata, comfort rating when valid, maximum deceleration, and whole-run heart-rate change.
+
+## Two-Stage Prediction Pipeline
+
+The deployed model first predicts the driver decision and then generates the acceleration trajectory conditioned on that decision. The Stage 2 Transformer receives the current kinematic state, the previous post-constraint acceleration, the Stage 1 decision output, and the stopping goal. Its output is passed through deterministic physical constraints before kinematic integration.
+
+![Two-stage prediction pipeline](assets/two_stage_pipeline.png)
+
+The original paper figure is also provided as [`assets/architecture_pipeline_schematic_modern.pdf`](assets/architecture_pipeline_schematic_modern.pdf).
 
 ## Repository Layout
 
 ```text
 .
 ├── assets/
-│   ├── pipeline_overview.png
-│   └── experiment_distribution.png
+│   ├── overview_exp_setup.pdf
+│   ├── overview_exp_setup.png
+│   ├── architecture_pipeline_schematic_modern.pdf
+│   └── two_stage_pipeline.png
 ├── data/
 │   ├── refined_run_level_dataset.csv
 │   └── processed_trajectory_cache/
@@ -37,6 +51,8 @@ The full experiment produced 449 runs. The released decision and trajectory mode
 ├── requirements.txt
 └── results/
 ```
+
+The repository does not include raw logs, personal information, exploratory analysis scripts, or alternative baseline models. Heart-rate information is included only as whole-run change values, not as a time series.
 
 ## Environment
 
@@ -179,4 +195,20 @@ python trajectory_transformer_ar.py \
   --decision-epochs 1 \
   --out-dir results/smoke_test \
   --force-cpu
+```
+
+## Citation
+
+If you use this dataset, code, or model structure, please cite the associated paper. The arXiv identifier will be added after the preprint is released.
+
+```bibtex
+@misc{khoshkdahan2026stopgotransformer,
+  title        = {Predicting Human Driver Deceleration Behavior at Signalized Intersections using Physics-Informed Decision-Conditioned Autoregressive Transformers},
+  author       = {Khoshkdahan, Mohammad and Vinel, Alexey and Laskov, Pavel},
+  year         = {2026},
+  eprint       = {arXiv:to appear},
+  archivePrefix= {arXiv},
+  primaryClass = {cs.LG},
+  note         = {Preprint to appear on arXiv}
+}
 ```

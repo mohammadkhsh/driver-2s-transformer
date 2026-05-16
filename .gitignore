@@ -17,6 +17,7 @@ results/**
 *.pkl
 *.joblib
 *.pdf
+!assets/*.pdf
 *.png
 !assets/*.png
 *.svg
