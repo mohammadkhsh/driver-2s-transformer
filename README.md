@@ -199,16 +199,18 @@ python trajectory_transformer_ar.py \
 
 ## Citation
 
-If you use this dataset, code, or model structure, please cite the associated paper. The arXiv identifier will be added after the preprint is released.
+If you use this dataset, code, or model structure, please cite our paper, accepted for publication at ITSC 2026. The [preprint is available on arXiv](https://arxiv.org/abs/2609.16058).
 
 ```bibtex
-@misc{khoshkdahan2026stopgotransformer,
-  title        = {Driver Behavior Estimation at Signalized Intersections Using a Physics-Constrained Decision-Conditioned Autoregressive Transformer},
-  author       = {Khoshkdahan, Mohammad and Laskov, Pavel and Vinel, Alexey},
-  year         = {2026},
-  eprint       = {arXiv:to appear},
-  archivePrefix= {arXiv},
-  primaryClass = {cs.LG},
-  note         = {Preprint to appear on arXiv}
+@inproceedings{khoshkdahan2026driver,
+  title         = {Driver Behavior Estimation at Signalized Intersections Using a Physics-Constrained Decision-Conditioned Autoregressive Transformer},
+  author        = {Khoshkdahan, Mohammad and Laskov, Pavel and Vinel, Alexey},
+  booktitle     = {2026 IEEE 29th International Conference on Intelligent Transportation Systems (ITSC)},
+  year          = {2026},
+  eprint        = {2609.16058},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2609.16058},
+  note          = {Accepted for publication}
 }
 ```
