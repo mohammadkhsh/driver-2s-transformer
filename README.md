@@ -8,7 +8,7 @@ This repository contains the public code and processed data for predicting human
 
 The released pipeline has two stages. Stage 1 predicts the stop/go decision from the driving state at yellow onset. Stage 2 uses the predicted decision and its confidence score to generate a physically constrained acceleration trajectory with an autoregressive Transformer.
 
-The paper preprint will be available on arXiv. If you use this repository or dataset, please cite the paper using the BibTeX entry at the end of this README.
+The paper preprint is available on arXiv ([Paper](https://arxiv.org/abs/2609.16058v1). If you use this repository or dataset, please cite the paper using the BibTeX entry at the end of this README.
 
 ## Experiment Overview
 
